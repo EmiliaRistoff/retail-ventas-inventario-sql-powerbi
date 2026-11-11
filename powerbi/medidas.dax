@@ -1,0 +1,155 @@
+// ============================================================
+// medidas.dax  |  Modelo en estrella del retail
+// Pegar cada bloque con "Modelado > Nueva tabla" o "Nueva medida".
+//
+// Tablas (renombrar al importar las vistas de MySQL):
+//   fact_ventas      <- vw_fact_ventas
+//   fact_inventario  <- vw_fact_inventario
+//   dim_producto     <- vw_dim_producto
+//   dim_sucursal     <- vw_dim_sucursal
+//   dim_cliente      <- vw_dim_cliente
+//   Calendario       <- tabla DAX de este archivo
+//
+// Relaciones (todas uno a varios, filtro en una sola dirección):
+//   dim_producto[producto_id] -> fact_ventas[producto_id]
+//   dim_producto[producto_id] -> fact_inventario[producto_id]
+//   dim_sucursal[sucursal_id] -> fact_ventas[sucursal_id]
+//   dim_sucursal[sucursal_id] -> fact_inventario[sucursal_id]
+//   dim_cliente[cliente_id]   -> fact_ventas[cliente_id]
+//   Calendario[Date]          -> fact_ventas[fecha]
+// ============================================================
+
+// ---------- TABLA (Nueva tabla) ----------
+// Luego: Herramientas de tabla > Marcar como tabla de fechas (columna Date).
+// Después de crearla: seleccionar "Día semana" y, en Herramientas de columna,
+// "Ordenar por columna" > "Día semana N". Con el mes ocurre lo mismo.
+Calendario =
+ADDCOLUMNS (
+    CALENDAR (
+        DATE ( YEAR ( MIN ( fact_ventas[fecha] ) ), MONTH ( MIN ( fact_ventas[fecha] ) ), 1 ),
+        EOMONTH ( MAX ( fact_ventas[fecha] ), 0 )
+    ),
+    "Año", YEAR ( [Date] ),
+    "Año-Mes", FORMAT ( [Date], "yyyy-mm" ),
+    "Año-Trimestre", YEAR ( [Date] ) & "-T" & QUARTER ( [Date] ),
+    // TRUE para las fechas que tienen un año anterior dentro de los datos
+    // (en este modelo, desde enero de 2026). Se usa en Variación interanual %.
+    "Con año anterior", [Date] >= EDATE ( MIN ( fact_ventas[fecha] ), 12 ),
+    "Día semana N", WEEKDAY ( [Date], 2 ),
+    "Día semana",
+        SWITCH ( WEEKDAY ( [Date], 2 ),
+            1, "Lun", 2, "Mar", 3, "Mié", 4, "Jue", 5, "Vie", 6, "Sáb", "Dom" )
+)
+
+// ---------- VENTAS ----------
+Ventas =
+SUM ( fact_ventas[importe] )
+
+Margen =
+SUM ( fact_ventas[margen] )
+
+Margen % =
+DIVIDE ( [Margen], [Ventas] )
+
+Tickets =
+DISTINCTCOUNT ( fact_ventas[venta_id] )
+
+Unidades =
+SUM ( fact_ventas[cantidad] )
+
+Ticket promedio =
+DIVIDE ( [Ventas], [Tickets] )
+
+Unidades por ticket =
+DIVIDE ( [Unidades], [Tickets] )
+
+Ventas por m² =
+DIVIDE ( [Ventas], SUM ( dim_sucursal[superficie_m2] ) )
+
+// ---------- DESCUENTOS ----------
+Descuento otorgado =
+SUMX (
+    fact_ventas,
+    fact_ventas[cantidad] * fact_ventas[precio_unitario] * fact_ventas[descuento_pct] / 100
+)
+
+% descuento sobre venta bruta =
+DIVIDE ( [Descuento otorgado], [Ventas] + [Descuento otorgado] )
+
+// ---------- TIEMPO (requieren la tabla Calendario) ----------
+Ventas mes anterior =
+CALCULATE ( [Ventas], DATEADD ( Calendario[Date], -1, MONTH ) )
+
+Variación vs mes anterior % =
+DIVIDE ( [Ventas] - [Ventas mes anterior], [Ventas mes anterior] )
+
+Ventas año anterior =
+CALCULATE ( [Ventas], SAMEPERIODLASTYEAR ( Calendario[Date] ) )
+
+// Compara solo las fechas que tienen año anterior en los datos. Sin este
+// filtro, si no hay un año seleccionado, [Ventas] suma los 22 meses y
+// [Ventas año anterior] solo los 10 meses de 2025, y el resultado (+183 %)
+// no tiene sentido. Con el filtro: 2026 (ene-oct) vs. 2025 (ene-oct).
+Variación interanual % =
+VAR actual =
+    CALCULATE ( [Ventas], Calendario[Con año anterior] = TRUE () )
+VAR previo =
+    CALCULATE ( [Ventas año anterior], Calendario[Con año anterior] = TRUE () )
+RETURN
+    DIVIDE ( actual - previo, previo )
+
+Ventas YTD =
+TOTALYTD ( [Ventas], Calendario[Date] )
+
+// ---------- PARTICIPACIÓN Y CLIENTES ----------
+% de ventas =
+DIVIDE ( [Ventas], CALCULATE ( [Ventas], ALLSELECTED () ) )
+
+% ventas de socios =
+DIVIDE ( CALCULATE ( [Ventas], fact_ventas[cliente_id] <> BLANK () ), [Ventas] )
+
+Socios activos =
+DISTINCTCOUNT ( fact_ventas[cliente_id] )
+
+// ---------- INVENTARIO ----------
+Stock unidades =
+SUM ( fact_inventario[stock_actual] )
+
+Stock mínimo =
+SUM ( fact_inventario[stock_minimo] )
+
+Stock valorizado =
+SUM ( fact_inventario[stock_valorizado] )
+
+Pares bajo mínimo =
+SUM ( fact_inventario[bajo_minimo] )
+
+% pares bajo mínimo =
+DIVIDE ( [Pares bajo mínimo], COUNTROWS ( fact_inventario ) )
+
+// Unidades vendidas en los 90 días previos a la última venta registrada
+// (ignora los filtros de fecha de la página para que la cobertura sea estable)
+Unidades 90d =
+VAR fin = CALCULATE ( MAX ( fact_ventas[fecha] ), ALL ( fact_ventas ) )
+RETURN
+    CALCULATE (
+        [Unidades],
+        FILTER ( ALL ( Calendario[Date] ), Calendario[Date] > fin - 90 && Calendario[Date] <= fin )
+    )
+
+Días de cobertura =
+DIVIDE ( [Stock unidades], DIVIDE ( [Unidades 90d], 90 ) )
+
+// Días que alcanza el stock de cada par sucursal-producto menos el plazo de
+// entrega del proveedor. Negativo = el stock se agota antes de que llegue el
+// pedido. Úsala en la tabla "Reposición urgente" para ordenar por urgencia real.
+// Devuelve vacío si el par no está en inventario, no está bajo el mínimo o no
+// tuvo ventas en 90 días. Sin esa condición, en DAX "vacío - plazo" da -plazo y
+// la tabla se llena de combinaciones sucursal-producto que no existen.
+Cobertura menos plazo (días) =
+VAR cobertura = [Días de cobertura]
+RETURN
+    IF (
+        NOT ISBLANK ( cobertura ) && [Pares bajo mínimo] > 0,
+        cobertura - MAX ( dim_producto[plazo_entrega_dias] )
+    )
